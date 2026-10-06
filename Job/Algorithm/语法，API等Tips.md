@@ -174,6 +174,10 @@ Queue<Integer> q2 = new ArrayDeque<>();   // 也常见，比 LinkedList 性能�
     
     `for (Map.Entry<Integer, Integer> e : map.entrySet()) {     int k = e.getKey(), v = e.getValue(); }`
 
+
+`map.computeIfAbsent(u, k -> new ArrayList<>()).add(v);` 先去 map 里找 `u`，如果没找到，就执行后面的 Lambda 表达式 `new ArrayList<>()` 并且放进 map 里，**最后把这个 List 的引用返回**。常用于优雅建图。
+
+
 ``` java
 // 合并并计数元素
 Map<Integer, Integer> map = new HashMap();
@@ -188,6 +192,15 @@ map.merge(c, 1, Integer::sum); // 略微比上面那种方法慢
 Map<Integer, Long> counts = Arrays.stream(nums)
     .boxed() // int 转 Integer，因为 collect 不支持原始类型流
     .collect(Collectors.groupingBy(n -> n, Collectors.counting()));
+
+
+// 优雅建图
+graph.computeIfAbsent(u, k -> new ArrayList<>()).add(v);
+// 等同于
+if (!graph.containsKey(u)) {
+    graph.put(u, new ArrayList<>());
+}
+graph.get(u).add(v);
 
 ```
 
