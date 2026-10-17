@@ -81,3 +81,9 @@
     - _问题：_ Netty 是如何封装 NIO 的？
         
     - _回答切入点：_ Netty 采用了主从 Reactor 多线程模型。`BossGroup` 专职处理 Accept 事件，建立连接后交给 `WorkerGroup`；`WorkerGroup` 中的 EventLoop 线程绑定具体的 Selector，负责后续所有的读写网络 IO 和任务调度。
+
+
+
+**JDK19+引入虚拟线程之后，传统的BIO是不是可行了？能打败NIO吗？**
+
+有了虚拟线程当然可以写阻塞式BIO，性能不逊色于NIO，但是JDK19+为了支持虚拟线程同时也重写了所有网络IO的API，因此调用BIO实际上底层干活的还是基于epoll的NIO多路复用机制。
