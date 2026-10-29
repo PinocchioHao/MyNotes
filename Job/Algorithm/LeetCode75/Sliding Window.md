@@ -1,3 +1,8 @@
+## TODO 哪类问题可以用滑窗来解，基本套路
+定长滑窗一般都可以考虑前缀和？
+
+
+
 ## 643 子数组的最大平均数I
 [643. Maximum Average Subarray I](https://leetcode.com/problems/maximum-average-subarray-i/)
 You are given an integer array `nums` consisting of `n` elements, and an integer `k`.

@@ -61,9 +61,9 @@ Queue<Integer> q2 = new ArrayDeque<>();   // 也常见，比 LinkedList 性能�
 
 **常用方法：**
 
-- `q.add(x)` / `q.offer(x)` → 入队
+- `q.add(x)` / `q.offer(x)` → 入队（队尾添加元素）
     
-- `q.poll()` → 出队（队空返回 `null`）
+- `q.poll()` → 出队（弹出队头元素，队空返回 `null`）
     
 - `q.peek()` → 查看队头（不删除）
     
