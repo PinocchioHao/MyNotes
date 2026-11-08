@@ -1,6 +1,7 @@
 ## Spring Boot 简介 & 进阶
 ### Spring Boot 的优点
 首先，它**继承了 Spring 所有的优秀基因**，包括轻量级、IOC 解耦、AOP 切面以及声明式事务。 但更重要的是，它是基于 Spring 封装的脚手架，核心理念是‘约定大于配置’。它解决了以前 Spring 开发的两大痛点：一是通过提供 Starter 机制，统一了依赖版本管理，解决了 Jar 包冲突；二是通过内置 Web 容器（如 Tomcat）和自动装配机制，干掉了繁琐的 XML 配置，让我们能通过一个 main 方法直接跑起一个服务，真正实现了开箱即用。
+
 ### Spring Boot 自动装配原理
 自动装配的入口是 `@SpringBootApplication` 这个复合注解，里面包含三大核心：
 
@@ -9,7 +10,6 @@
 2. **`@ComponentScan`**：负责扫描当前主类包及子包下的 Bean。
     
 3. **`@EnableAutoConfiguration`**：**这是自动装配的核心。** 它通过 `@Import` 机制，读取所有引入的 jar 包里的 `spring.factories`（或 `.imports`）文件。把里面声明的配置类全限定名拿出来。接着，利用 `@Conditional` 系列注解进行‘疯狂过滤’，剔除当前环境不需要的类，最后把剩下的有效组件注入到 IOC 容器中。
-
 
 ### 按需加载 @Conditional
 它是动态装配的核心，把硬编码变成了可配置。
@@ -348,6 +348,24 @@ Spring AOP 的底层核心就是动态代理。 如果是旧版 Spring，目标�
 ---
 ## 事务控制
 
+### **Spring 本地事务底层原理**
+Spring `@Transactional` 底层**绝对没有**去解析 SQL 或者写 Undo Log。它干的活非常纯粹，就是**管理 Connection**。
+
+> “Spring 事务的本质是 **AOP 动态代理 + ThreadLocal**。 当你调用加了注解的方法时，AOP 代理拦截了这个请求。它去数据源拿一个 `Connection`，把自动提交关掉（`setAutoCommit(false)`），然后把这个 Connection 挂载到当前线程的 `ThreadLocal` 上。 接着执行你的业务代码，所有的 MyBatis/Hibernate 操作只要在同一个线程，就会去 `ThreadLocal` 里拿到同一个 Connection 执行 SQL。 方法结束时，代理逻辑捕获有没有抛出异常，决定是调用 `Connection.commit()` 还是 `rollback()`。 **真正的回滚，靠的是 MySQL 数据库自身的 Undo Log，Spring 只是发号施令。**”
+
+不管上层框架如何演进（Spring、JFinal 还是原生 Servlet），在 Java 层控制本地事务的物理底座永远只有两个核心要素：
+
+1. **关闭自动提交：** `connection.setAutoCommit(false)`，将控制权收归业务。
+    
+2. **保证线程内 Connection 唯一：** 确保跨多个 DAO 层的 SQL 操作，拿到的是同一根数据库连接。
+    
+**不同框架仅仅是“拦截时机”与“封装形式”的不同：**
+
+- **脱离 Spring 的纯 Servlet 玩法（过滤器模式）：** 我们在最外层定义一个 Servlet Filter 拦截 HTTP 请求。请求进来时，从连接池取出一个 `Connection`，关闭自动提交，并塞入我们手写的 `ThreadLocal` 中。后续业务代码全从该 `ThreadLocal` 拿连接执行 SQL。等 HTTP 响应返回前，Filter 统一在 `finally` 块中执行 `commit` 或 `rollback`，并清空 ThreadLocal。
+    
+- **Spring 事务的玩法（AOP 模式）：** Spring 只是把这个过程封装成了 `TransactionSynchronizationManager`（底层本质就是一个大 ThreadLocal）。它通过 AOP 动态代理，把拦截时机从“HTTP 请求进出”缩小到了“加了 `@Transactional` 注解的方法进出”。**总结：Spring 只是发号施令的门卫，真正执行回滚的，是底层数据库的原生 Undo Log。**
+
+
 ### 传播机制
 > 简单来讲，就是当系统中存在两个事务方法时（我们暂称为方法A和方法B），如果方法B在方法A中被调用，那么将采用什么样的事务形式，就叫做事务的传播特性  
 > 比如，A方法调用了B方法（B方法必须使用事务注解），那么B事务可以是一个在A中嵌套的事务，或者B可以新开一个独立的事务，或是使用与A事务相同的事务，又或者B事务不使用事务，这些均可以通过指定事务传播特性来实现
@@ -532,3 +550,34 @@ Spring 并不自己实现隔离级别，而是直接透传给底层数据库（�
 4. **抛出的异常不匹配：** 默认只回滚 `RuntimeException` 和 `Error`，如果抛了受检异常（如 `IOException`）且没配 `rollbackFor = Exception.class`，同样失效。
     
 5. **数据库引擎不支持：** 表的引擎如果是 MyISAM，Spring 配置得再好也没用。
+
+
+
+ 
+### **MyBatis 自定义封装一个查询怎么做？**
+题意是在架构层面，如何拦截 MyBatis 的底层执行链路，把一些全公司通用的查询逻辑（如数据隔离、分页、脱敏）统一下沉，做到对上层业务代码零侵入？
+
+要封装/修改查询，你必须知道 MyBatis 底层执行 SQL 需要经过四个核心对象：
+
+1. **Executor（执行器）：** 负责调度整个过程，管理缓存。
+    
+2. **StatementHandler（语句处理器）：** 负责把 SQL 和参数拼接好（**拦截 SQL 最常改造的地方**）。
+    
+3. **ParameterHandler（参数处理器）：** 负责给 SQL 里的 `?` 占位符赋值。
+    
+4. **ResultSetHandler（结果处理器）：** 负责把查出来的结果集映射成 Java List/对象。
+
+#### 实战场景：为什么要用拦截器封装？
+
+假设你们银行/金融系统有一个极度严格的安全规定：**所有查询必须带上当前租户的 ID（多租户隔离），或者查出来的敏感字段（手机号、身份证）必须脱敏打码。**
+
+- **低级做法：** 让所有开发人员在每一个 XML 的 SQL 后面手动加 `WHERE tenant_id = xxx`。极容易漏写，一旦漏写直接造成跨租户数据泄露（P0级安全生产事故）。
+    
+- **架构解法（面试官想要的）：** 使用 MyBatis 拦截器。
+    
+
+> **💡 高分面试话术总结：** “如果是指架构层面的底层封装，我会利用 MyBatis 的 **Interceptor（插件机制）** 来实现对业务零侵入的查询拦截。
+> 
+> MyBatis 底层有四大核心对象，我们通常会拦截 **StatementHandler**。 比如在我们的系统中，为了实现绝对安全的多租户数据隔离，需要自定义拦截器，实现`ibatis`的`Interceptor`接口，并重写`intercept`方法，拦截目标方法。 当一条原生的 `SELECT * FROM order` 准备发送给数据库前，拦截器会被触发。我会利用 **JSqlParser** 这个语法树解析工具，把 SQL 解析出来，强行在 `WHERE` 条件后面拼上 `AND tenant_id = ?`，并从 `ThreadLocal` 里取出当前登录用户的租户 ID 塞进去。
+> 
+> 这样封装的好处是：上面的业务开发同事只需要写最纯粹的业务 SQL，不用管任何租户隔离逻辑，拦截器在底层完成了 SQL 的重写和封装，从根源上杜绝了人为漏写导致的数据越权事故。”

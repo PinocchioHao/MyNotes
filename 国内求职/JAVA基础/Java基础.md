@@ -213,3 +213,83 @@ public int hashCode() {
 > 
 > **细节亮点：** 在兜底未知异常时，我绝对不会把原生的 SQL 报错或 Null 堆栈直接抛给前端，而是统一返回‘系统繁忙’。同时，我会结合 SLF4J 和 Logback，**在错误日志中打印出当前请求的 TraceID 和完整堆栈**。这样前端只需要把 TraceID 报过来，我就能秒级在日志系统里定位到问题所在。”
 
+
+### 克隆，深拷贝与浅拷贝
+- **浅拷贝：** 拷贝出来的对象，基础数据类型是新的，但里面的引用类型（比如里面包含的一个 `List` 或 `User` 对象）依然**指向原来那个对象的内存地址**。动了新对象里的引用对象，老对象跟着变。
+    
+- **深拷贝：** 不仅拷贝外层对象，还会递归地把内部所有的引用对象全部复制一份全新的。新老对象在内存里彻底物理隔离，互不影响。
+
+**实战：**
+
+> “在真实的 Java 企业级开发中，我们**极其排斥**通过实现 `Cloneable` 接口和重写 `clone()` 方法来做深拷贝。因为如果对象嵌套了 5 层，你就得写 5 层深度的递归克隆代码，非常恶心且极易漏写引发 Bug。
+> 
+> **工业界有两套成熟的解法：**
+> 
+> 1. **序列化深拷贝（最通用）：** 直接用 JSON 工具（如 Jackson / Fastjson）把老对象序列化成一段 JSON 字符串，然后再把这段字符串反序列化成一个新对象。这种方式天然斩断了所有内存引用，代码只有一行，极度安全。
+>     
+> 2. **编译期代码生成（性能最高）：** 比如使用 **MapStruct** 框架。我们在写 DTO 和 Entity 互相转换时，只需要定义一个接口，MapStruct 会在编译阶段（类似 Lombok），自动帮我们在字节码层面生成极致性能的 Getter/Setter 拷贝代码，这也是目前微服务项目中最主流的数据拷贝方式。”
+>
+
+“为了解决 DTO 转换的性能和**漏字段问题**，我们彻底抛弃了基于反射的 `BeanUtils`，引入了 **MapStruct**。 它的底层逻辑和 Lombok 非常像，它根本不用反射，而是在**代码编译阶段（AST 语法树解析）**，自动帮你生成你当年纯手工敲的那些 `a.setName(b.getName())` 代码。 **两大优势：**
+
+1. **极致性能：** 运行期就是纯原生的 getter/setter 调用，没有任何反射开销。
+    
+2. **编译期保底：** 如果我把 Entity 里的 `userName` 改成了 `name`，导致 DTO 无法映射，MapStruct 在**编译时直接标红报错**，根本不会把这个隐患带到线上。”
+
+### Java新特性相关 
+**1. Java 8 (编程范式的升级：从命令式到声明式)**
+
+> “Java 8 对我日常开发最大的改变是 **Stream API + Lambda + Optional**。 以前从数据库查出上千条 Entity，要转成 DTO、过滤掉无效状态、再按某个字段分组，需要写一大堆 `for` 循环和 `if-else`，全是过程式代码（命令式）。 现在通过 Stream API，代码变成了‘声明式’，数据像流水线一样经过 `.map()`, `.filter()`, `.collect(Collectors.groupingBy())`。代码不仅从几十行缩减到三四行，而且表意极度清晰。结合 `Optional.ofNullable()`，我们再也不用写那种满天飞的 `if (obj != null)` 防御代码了。”
+```java
+// 场景：从数据库查出 1000 个 OrderEntity，过滤掉已取消的订单，
+// 转换成 OrderDTO，最后按 userId 分组。
+
+Map<Long, List<OrderDTO>> userOrderMap = orderEntityList.stream()
+    // 1. 过滤：只保留状态正常的订单
+    .filter(order -> order.getStatus() == 1)
+    // 2. 映射：Entity 转 DTO (配合 MapStruct 或 构造器)
+    .map(order -> new OrderDTO(order.getId(), order.getUserId(), order.getAmount()))
+    // 3. 收集与分组：按 userId 分组放入 Map
+    .collect(Collectors.groupingBy(OrderDTO::getUserId));
+```
+
+
+
+**2. Java 21 (底层性能革命：虚拟线程 Virtual Threads)**
+
+> “现代 Java 最大的突破是 JDK 21 的虚拟线程。 传统的 Java 线程是和操作系统的内核线程 1:1 绑定的，非常昂贵（创建慢、占内存大）。在 Tomcat 这种 BIO 模型下，几百个线程就能把机器撑爆。 虚拟线程打破了这个限制，它由 JVM 自己调度，极其轻量（可以轻松创建上百万个）。它让我们可以**继续用传统同步阻塞（写同步代码）的简单方式，去获得类似 WebFlux / Netty 那种异步非阻塞的极高并发性能**，彻底解放了 I/O 密集型应用的吞吐量。”
+
+
+
+
+### Java注解原理
+按生命周期（`@Retention`），注解的底层原理分为截然不同的三大派系：
+
+#### 1. 源码阶段（`RetentionPolicy.SOURCE`）—— 编译器与 AST 解析
+
+这类注解在编译成 `.class` 文件后就消失了，纯粹是给**编译器**看的。
+
+- **比如 `@Override`、`@SuppressWarnings`：** 编译器在把 Java 代码编译成字节码时，如果看到 `@Override`，就会去父类校验有没有这个方法。没有就直接报错。这里的原理是**编译器硬编码的校验逻辑**。
+    
+- **比如 Lombok 的 `@Data`、`@Slf4j`：** 底层原理是 **Pluggable Annotation Processing API（插入式注解处理器，JSR 269）**。在代码编译阶段，Lombok 的处理器会拦截并修改抽象语法树（AST），强行在内存里的语法树上长出 Getter/Setter 方法的节点，最后再生成字节码。
+    
+
+#### 2. 编译/类加载阶段（`RetentionPolicy.CLASS`）—— 静态分析与字节码操作
+
+这类注解会保留在 `.class` 文件中，但 JVM 运行时不一定认。
+
+- **比如 `@Nullable`、`@NonNull`：** 这类注解对 JVM 运行没有任何影响。它的作用是给 **IDE（如 IDEA）** 或者 **静态代码检查工具（如 SpotBugs、SonarQube）** 扫描用的。如果你给 `@NonNull` 传了 null，IDEA 会标黄警告，但强行运行也不会在这一行报空指针。
+    
+
+#### 3. 运行阶段（`RetentionPolicy.RUNTIME`）—— 反射 + 动态代理（工业界核心）
+
+这是我们日常业务开发中最常用的注解（Spring 原生注解、自定义业务注解），它们会一直保留到 JVM 内存中。
+
+- **比如 `@Transactional`、`@RestController`、自定义的 `@RateLimit`：**
+    
+    - **第一步（扫描）：** 系统启动时，Spring 容器通过 **Java 反射机制（Reflection）** `Class.getAnnotation()` 扫描全盘，把贴了这些标签的类或方法找出来。
+        
+    - **第二步（织入逻辑）：** 找到后，Spring 会利用 **动态代理（JDK Proxy 或 CGLIB）**，在内存中动态生成一个代理子类。当你调用这个方法时，其实是调用代理类，代理类会在执行你写的代码前后，塞入额外的逻辑（比如开启事务、进行限流校验等）。
+        
+
+> **💡 高分面试话术总结：** “注解本质上只是元数据，自身没有业务逻辑。它的实现原理取决于解析它的生命周期： 第一类是 SOURCE 级别，比如 `@Override` 和 Lombok，依靠**编译器校验**和**修改 AST（抽象语法树）**在编译期生成代码。 第二类是 CLASS 级别，比如 `@Nullable`，主要供 **IDE 和静态代码分析工具**做校验。 第三类是 RUNTIME 级别，比如 Spring 的 `@Transactional` 和我们的自定义注解。它的原理是在系统启动时通过**反射**识别目标，然后利用 **CGLIB 或 JDK 动态代理**生成代理类，在运行时通过 AOP 切面织入真正的业务逻辑。”
