@@ -389,6 +389,67 @@ MySql的索引基于底层的数据引擎，InnoDB和 MyISAM是基于B+树实现
 > 最常见的业务死锁场景是转账或互相更新：比如线程 A 处理‘账户 1 转给账户 2’，先锁账户 1 再锁账户 2；同时线程 B 处理‘账户 2 转给账户 1’，先锁 2 再锁 1，并发时必死锁。 **我的改造方案是：** 强行在业务层统一加锁顺序。比如根据账户 ID 的大小，无论谁转给谁，**永远先锁 ID 小的，再锁 ID 大的**。顺序一旦统一，死锁的闭环就被彻底打破了。此外，我也会审查代码，把**大事务拆小**，尽量缩短行锁的持有时间。”
 
 
+举例，银行账户互相转账（依靠 ID 大小排序防死锁）：
+
+**1. 容易死锁的反面教材代码：**
+
+```Java
+@Transactional
+public void transferBad(Long fromId, Long toId, BigDecimal amount) {
+    // 假设 A 转给 B (fromId=1, toId=2) -> 先锁行 1，再锁行 2
+    // 如果同时 B 转给 A (fromId=2, toId=1) -> 先锁行 2，再锁行 1
+    // 两者并发，极大概率在数据库底层形成死锁环！
+    
+    // 1. 查余额并加锁 (锁定付款方)
+    Account from = accountMapper.selectForUpdate(fromId);
+    if (from.getBalance().compareTo(amount) < 0) {
+        throw new BusinessException("余额不足");
+    }
+    
+    // 2. 锁定收款方并执行转账
+    Account to = accountMapper.selectForUpdate(toId);
+    accountMapper.decrease(fromId, amount);
+    accountMapper.increase(toId, amount);
+}
+```
+
+**2. 架构师级别的防死锁代码（统一加锁顺序）：**
+
+```Java
+@Transactional
+public void transferSafe(Long fromId, Long toId, BigDecimal amount) {
+    // 【核心破局点】：强行重排加锁顺序，永远先锁 ID 小的行
+    Long firstLockId = fromId < toId ? fromId : toId;
+    Long secondLockId = fromId < toId ? toId : fromId;
+
+    // 1. 无论谁转给谁，业务层强制按 ID 从小到大去数据库拿行锁（X锁）
+    // 此时无论并发多少请求，所有线程在底层都在按同一顺序排队，彻底打破死锁环！
+    Account firstAccount = accountMapper.selectForUpdate(firstLockId);
+    Account secondAccount = accountMapper.selectForUpdate(secondLockId);
+
+    // 2. 在 Java 内存里，再重新区分谁是付款方，谁是收款方
+    Account fromAccount = firstLockId.equals(fromId) ? firstAccount : secondAccount;
+    
+    // 3. 业务校验
+    if (fromAccount.getBalance().compareTo(amount) < 0) {
+        throw new BusinessException("余额不足");
+    }
+
+    // 4. 执行扣减和增加（此时两行数据的锁都已经稳稳捏在当前线程手里，怎么修改都绝对安全）
+    accountMapper.decrease(fromId, amount);
+    accountMapper.increase(toId, amount);
+}
+```
+
+
+**死锁防范（Deadlock）：ERP系统中连环查表也有可能出现死锁**
+
+- **ERP 场景：** 多个复杂的业务方法，都在同时操作 A 表、B 表、C 表。
+    
+- **你的回答套路：** “ERP 表关联极多，写代码时我通常会要求团队**严格约定更新表的顺序**（比如永远先锁主表，再锁明细表）。如果不按顺序加锁，极易在数据库底层产生死锁。”
+
+
+
 
 ### 锁等待超时问题
 #### 现象：
@@ -546,3 +607,135 @@ MySql的索引基于底层的数据引擎，InnoDB和 MyISAM是基于B+树实现
     - **Buffer Pool 被洗劫：** `EXPLAIN` 不知道数据是在内存里还是磁盘上。如果刚刚有跑批任务把内存热数据全挤出去了，我的查询就必须去磁盘排队拉取数据页，发生物理读，速度断崖式下跌。
         
     - **排队效应：** 数据库毫无压力，但应用端的 HikariCP 数据库连接池被打满了，请求在 Java 内存里排队就耗了 3 秒；或者是同一台宿主机上其他进程榨干了磁盘 IOPS。”
+
+
+
+
+## MySQL常见操作
+### 1. 分组求极值
+**业务场景：** 获取每个学生成绩最高的那一门科目的完整信息。**表结构与基础数据 (`student_scores`)：**
+
+| **id** | **student_name** | **subject** | **score** |
+| ------ | ---------------- | ----------- | --------- |
+| 1      | 张三               | 数学          | 85        |
+| 2      | 张三               | 英语          | 95        |
+| 3      | 李四               | 数学          | 90        |
+
+**业务场景：** 获取每个学生各科成绩中的最高分（这就是 Wesley 问你的那道题）。在 ERP 中常变形为“获取每个客户最近一次的下单记录”。**白板口述思路：** 先用 `GROUP BY` 找出每个人的最高分，然后再把自己和原表 `JOIN` 起来，获取对应的科目信息。
+
+```SQL
+-- 基础版：只求最高分是多少（Wesley 描述的表面需求）
+SELECT 
+    student_name, 
+    MAX(score) AS max_score 
+FROM student_scores 
+GROUP BY student_name;
+
+-- 进阶版：如果要查出具体是哪一科考了最高分（Leader 常挖的坑）
+-- 1. 内存里先形成一张虚拟的表 b（只有姓名和最高分）：张三-95，李四-90 
+-- 2. 拿原表 a 去 INNER JOIN 表 b，条件是姓名和分数都对得上。
+SELECT a.* 
+FROM student_scores a
+INNER JOIN (
+    SELECT student_name, MAX(score) AS max_score 
+    FROM student_scores 
+    GROUP BY student_name
+) b ON a.student_name = b.student_name AND a.score = b.max_score;
+```
+
+- **Leader 视角：** 看你懂不懂 `GROUP BY` 的限制（选了 GROUP BY 的字段，就**不能直接 SELECT 其他非聚合字段**）。如果你能口述出进阶版的 `JOIN` 或者提到 MySQL 8.0 的窗口函数 `ROW_NUMBER()`，瞬间展现高级感。
+    
+### 2. ERP 报表经典：行转列（多状态统计）
+
+**业务场景：** ERP 首页的 Dashboard，需要统计每个人今天“待审核”、“已通过”、“已驳回”的单据数量。数据在表里是多行，要求查出来是一行。**白板口述思路：** 使用 `SUM` 结合 `CASE WHEN` 实现状态的条件计数。
+
+输入：
+
+|**id**|**creator_name**|**status**|
+|---|---|---|
+|1|张三|PENDING (待审)|
+|2|张三|APPROVED (通过)|
+|3|张三|PENDING (待审)|
+|4|李四|REJECTED (驳回)|
+输出：
+
+|**creator_name**|**pending_count**|**approved_count**|**rejected_count**|
+|---|---|---|---|
+|张三|2|1|0|
+|李四|0|0|1|
+
+```SQL
+SELECT 
+    creator_name,
+    SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending_count,
+    SUM(CASE WHEN status = 'APPROVED' THEN 1 ELSE 0 END) AS approved_count,
+    SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) AS rejected_count
+FROM erp_orders
+GROUP BY creator_name;
+```
+
+- **Leader 视角：** 这是一道极其经典的业务报表题。写出 `CASE WHEN`，说明你真正在一线做过复杂的后台统计导出。
+
+### 3. 多表关联与空值处理：LEFT JOIN 的陷阱
+
+**业务场景：** 统计所有部门的当月报销总额。注意：有些部门这个月没有任何报销单，但也必须把部门名字显示出来，金额记为 0。**白板口述思路：** 必须用部门表做主表去 `LEFT JOIN` 报销表，并且用 `IFNULL`（或 `COALESCE`）处理没匹配到产生的 NULL 值。
+
+
+```SQL
+SELECT 
+    d.dept_name,
+    IFNULL(SUM(e.amount), 0) AS total_amount
+FROM departments d
+LEFT JOIN expenses e ON d.dept_id = e.dept_id AND e.month = '2026-11'
+GROUP BY d.dept_id, d.dept_name;
+```
+
+- **Leader 视角：** 考察你对左连接的理解，以及是否有严谨的边界意识（`IFNULL` 处理空指针异常）。注意连接条件要写在 `ON` 后面，而不是 `WHERE` 后面（写在 WHERE 会变成隐式的内连接，导致没有报销的部门消失）。
+
+
+### 4. 性能优化的常客：EXISTS 替代 IN
+
+**业务场景：** 查询出“至少下过一次订单”的所有客户信息。**白板口述思路：** 不要用 `IN` 去查一个几十万条的子查询，用 `EXISTS` 会快得多，因为它只要匹配到一条就立马返回（短路逻辑）。
+因为in是由内向外直接查询查出所有值，性能差并且可能全表扫描。而Exist只要找到一个即停止。
+
+```SQL
+-- 性能较差（外企/大厂面试常被喷）
+SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders);
+
+-- 性能极佳（Leader 狂喜）
+SELECT * FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o WHERE o.customer_id = c.id
+);
+```
+
+- **Leader 视角：** ERP 动辄几百万数据，这题直接考察你的慢 SQL 优化意识。口述时一定要强调：“在子表数据量大时，用 EXISTS 代替 IN 可以阻断全表扫描”。
+    
+
+### 5. ERP 特有的批量更新：基于关联表 UPDATE
+
+**业务场景：** 把所有“属于成都分公司”的员工的状态，批量更新为“冻结”。分公司信息在 `department` 表里，员工信息在 `employee` 表里。**白板口述思路：** 用 `UPDATE` 结合 `JOIN` 来做跨表更新。
+
+**常规错误思维：** 先 `SELECT` 查出成都的 `dept_id` 集合，再到 Java 里拼一个巨大的 `UPDATE employee SET status = 'FROZEN' WHERE dept_id IN (1, 2, 3...)`。
+
+```SQL
+UPDATE employee e
+INNER JOIN department d ON e.dept_id = d.id
+SET e.status = 'FROZEN'
+WHERE d.city = 'Chengdu';
+```
+
+- **Leader 视角：** 很多开发只会 `SELECT` 关联，不知道 `UPDATE` 和 `DELETE` 也能关联。在 ERP 数据清洗、跑批修复数据时，这个语法是极其高效的利器。
+    
+
+**备战建议：** 你不需要去背具体的表名和字段，你只需要拿一张白纸，把这 **5 个核心词** 写下来，在脑子里过一遍逻辑：
+
+1. **求极值** (`GROUP BY` + `JOIN` 自己)
+    
+2. **行转列** (`SUM` + `CASE WHEN`)
+    
+3. **保留空数据的统计** (`LEFT JOIN` + `IFNULL`)
+    
+4. **子查询优化** (`EXISTS` 替代 `IN`)
+    
+5. **跨表更新** (`UPDATE ... JOIN`)
